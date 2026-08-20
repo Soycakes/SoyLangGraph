@@ -276,6 +276,25 @@ class TestGraphIntegration:
         assert snap2.next == ("human_approval",)
         assert snap2.values["coworker_findings"] == []  # still reset, not 6 accumulated items
 
+    def test_null_diff_from_l4_does_not_false_pass_ast_gate(self, monkeypatch):
+        """Regression: ast_gate must not route to human_approval when proposed_diff is None.
+        A failed subprocess sets proposed_diff=None; ast_gate previously false-passed because
+        ast.parse('') returns True, bypassing retries and presenting a blank diff to the user.
+        """
+        def l4_always_fails(state):
+            return {"proposed_diff": None, "critique_feedback": "claude CLI not found"}
+
+        monkeypatch.setattr(graph_module, "layer4_synthesize", l4_always_fails)
+        g = build_graph()
+        config = {"configurable": {"thread_id": "null-diff"}}
+        g.invoke(base_state(), config=config)
+
+        snap = g.get_state(config)
+        # Must escalate after MAX_SYNTAX_RETRIES, never reach human_approval
+        assert snap.next != ("human_approval",)
+        assert snap.next == ("interrupt_human_escalation",)
+        assert snap.values["syntax_retry_count"] == MAX_SYNTAX_RETRIES
+
     def test_original_prompt_preserved_through_full_graph(self):
         g = build_graph()
         config = {"configurable": {"thread_id": "int-6"}}

@@ -1,12 +1,23 @@
 """
-SoyLangGraph — Phase 1 skeleton.
-Mock nodes wire the main spine; real LLM calls slot in later.
+SoyLangGraph — orchestration graph.
+Nodes with real LLM calls fall back to stubs when GEMINI_API_KEY is unset,
+keeping unit tests fully isolated without any changes to the test suite.
 """
+
+import platform
+import re
+import subprocess
 
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, StateGraph
 from langgraph.types import Send, interrupt
 
+from config import (
+    COWORKER_PROMPTS,
+    GEMINI_MODEL,
+    L1_SYSTEM_PROMPT,
+    get_gemini_client,
+)
 from state import CoworkerFinding, CoworkerInput, SharedBlackboard, SoyGraphState
 from verifiers import count_diff_lines, extract_diff_additions, strip_markdown_fences, validate_python_syntax
 
@@ -29,6 +40,52 @@ def _blackboard_field(state: SoyGraphState, field: str, default):
     return getattr(bb, field, default)
 
 
+def _gemini_generate(client, prompt: str, system: str) -> str:
+    """Single-call wrapper around client.models.generate_content."""
+    from google.genai import types
+    response = client.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=prompt,
+        config=types.GenerateContentConfig(system_instruction=system),
+    )
+    return (response.text or "").strip()
+
+
+def _extract_bullets(text: str) -> list[str]:
+    return [
+        line.lstrip("-•* ").strip()
+        for line in text.splitlines()
+        if line.strip().startswith(("-", "•", "*")) and line.strip().lstrip("-•* ")
+    ]
+
+
+def _parse_l1_response(text: str) -> dict:
+    """Extract PLAN from L1 response. Regex handles markdown bolding Gemini sometimes adds."""
+    match = re.search(r"(?:\*\*)?PLAN:?(?:\*\*)?\s*(.*?)(?=\nFILES:|\nCOMPLEXITY:|$)", text, re.IGNORECASE | re.DOTALL)
+    if match:
+        return {"current_plan": match.group(1).strip()}
+    return {"current_plan": text}  # fallback: treat whole response as plan
+
+
+def _parse_coworker_response(text: str, bias: str) -> dict:
+    """Parse coworker LLM output into a CoworkerFinding, or return {} on NO_ISSUES.
+    Returning {} (omitting coworker_findings) is the correct reducer contract —
+    an empty list [] would wipe sibling coworker results.
+    """
+    if "NO_ISSUES" in text.upper():
+        return {}
+    return {
+        "coworker_findings": [
+            CoworkerFinding(
+                agent_id=f"coworker-{bias}-live",
+                perspective_bias=bias,
+                assessment=text,
+                suggested_modifications=_extract_bullets(text),
+            )
+        ]
+    }
+
+
 # ── Stub / pass-through architecture nodes ───────────────────────────────────
 
 def l1_ponytail(state: SoyGraphState) -> dict:
@@ -47,50 +104,74 @@ def peer_verification(state: SoyGraphState) -> dict:
     # Phase 1: node registered but not yet wired into Gate3 conditional routing
 
 
-# ── Mock spine nodes ──────────────────────────────────────────────────────────
+# ── Layer 1: Context Analyst ──────────────────────────────────────────────────
 
 def layer1_context_check(state: SoyGraphState) -> dict:
-    """Gemini Flash context analysis — mock returns a minimal plan."""
-    return {"current_plan": f"[L1 stub] analyse: {state['original_prompt'][:80]}"}
+    """Gemini Flash context analysis. Falls back to stub when GEMINI_API_KEY is unset."""
+    client = get_gemini_client()
+    if client is None:
+        return {"current_plan": f"[L1 stub] analyse: {state['original_prompt'][:80]}"}
+    text = _gemini_generate(client, state["original_prompt"], L1_SYSTEM_PROMPT)
+    return _parse_l1_response(text)
 
+
+# ── Layer 2: Architect + Coworker Fan-Out ─────────────────────────────────────
 
 def layer2_architect(state: SoyGraphState) -> dict:
-    """Gemini Flash system architect — sets fanout_depth."""
+    """Gemini Flash system architect — stub sets fanout_depth=1. Demock in Phase 4."""
     return {
-        "current_plan": "[L2 stub] architecture plan",
+        "current_plan": state.get("current_plan") or "[L2 stub] architecture plan",
         "fanout_depth": 1,
     }
 
 
 def coworker_agent(state: CoworkerInput) -> dict:
-    """Mock coworker sub-agent; receives CoworkerInput-shaped state from Send().
-    IMPORTANT: never return coworker_findings=[] — omit the key if no findings.
+    """Gemini Flash coworker with perspective bias. Falls back to stub when GEMINI_API_KEY is unset.
+    IMPORTANT: return {} (omit key) when no findings — never return coworker_findings=[].
     An empty list is the reset sentinel in reduce_findings and will wipe sibling results.
     """
-    bias = state.get("bias", "unknown")
-    return {
-        "coworker_findings": [
-            CoworkerFinding(
-                agent_id=f"coworker-{bias}",
-                perspective_bias=bias,
-                assessment=f"[{bias} stub] no issues found",
-                suggested_modifications=[],
-            )
-        ]
-    }
+    bias = state.get("bias", "minimalist")
+    client = get_gemini_client()
+    if client is None:
+        return {
+            "coworker_findings": [
+                CoworkerFinding(
+                    agent_id=f"coworker-{bias}",
+                    perspective_bias=bias,
+                    assessment=f"[{bias} stub] no issues found",
+                    suggested_modifications=[],
+                )
+            ]
+        }
+    prompt = (
+        f"Plan to review:\n{state.get('plan_to_review', '')}\n\n"
+        f"System constraints:\n{state.get('system_constraints', [])}"
+    )
+    text = _gemini_generate(client, prompt, COWORKER_PROMPTS[bias])
+    return _parse_coworker_response(text, bias)
 
 
 def synthesize_plan(state: SoyGraphState) -> dict:
     """Distill coworker findings into current_plan, then reset the buffer."""
-    biases = [f.perspective_bias for f in state.get("coworker_findings", [])]
+    findings = state.get("coworker_findings", [])
+    base_plan = state.get("current_plan") or ""
+    if findings:
+        feedback = "\n\n".join(
+            f"[{f.perspective_bias}]\n{f.assessment}" for f in findings
+        )
+        plan = f"{base_plan}\n\nCoworker review:\n{feedback}"
+    else:
+        plan = base_plan
     return {
-        "current_plan": f"[L2 consensus] biases={biases}",
+        "current_plan": plan,
         "coworker_findings": [],  # reset sentinel — reduce_findings treats [] as replace
     }
 
 
+# ── Layer 3: Technical Critique ───────────────────────────────────────────────
+
 def layer3_critique(state: SoyGraphState) -> dict:
-    """Antigravity Flash + CLI — mock always passes. Returns 'PASS' or failure text."""
+    """Antigravity Flash + CLI — stub always passes. Demock in Phase 4."""
     return {"critique_feedback": "PASS"}
 
 
@@ -99,17 +180,59 @@ def handle_critique_failure(state: SoyGraphState) -> dict:
     return {"critique_iteration_count": state.get("critique_iteration_count", 0) + 1}
 
 
+# ── Layer 4: Lead Synthesizer ─────────────────────────────────────────────────
+
 def layer4_synthesize(state: SoyGraphState) -> dict:
-    """Claude Code headless subprocess — mock returns a stub diff."""
+    """Claude Code headless subprocess. Falls back to stub diff when GEMINI_API_KEY is unset."""
+    client = get_gemini_client()
+    if client is None:
+        return {
+            "proposed_diff": "--- a/stub.py\n+++ b/stub.py\n@@ -0,0 +1 @@\n+# stub\n",
+            "diff_line_count": 4,
+        }
+    prompt = (
+        f"Output ONLY a valid git unified diff for target files "
+        f"{state['target_files']}. No prose or explanations.\n\n"
+        f"Plan:\n{state['current_plan']}"
+    )
+    try:
+        result = subprocess.run(
+            ["claude", "-p", prompt],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            shell=(platform.system() == "Windows"),  # claude installs as .cmd on Windows
+        )
+    except FileNotFoundError:
+        return {"proposed_diff": None, "critique_feedback": "claude CLI not found — install @anthropic-ai/claude-code"}
+    except subprocess.TimeoutExpired:
+        return {"proposed_diff": None, "critique_feedback": "claude subprocess timed out after 120s"}
+
+    if result.returncode != 0:
+        stderr = (result.stderr or "")[:300]
+        return {"proposed_diff": None, "critique_feedback": f"claude exit {result.returncode}: {stderr}"}
+
+    diff = result.stdout.strip()
     return {
-        "proposed_diff": "--- a/stub.py\n+++ b/stub.py\n@@ -0,0 +1 @@\n+# stub\n",
-        "diff_line_count": 4,
+        "proposed_diff": diff,
+        "diff_line_count": count_diff_lines(strip_markdown_fences(diff)),
     }
 
 
+# ── AST gate & approval ───────────────────────────────────────────────────────
+
 def ast_gate(state: SoyGraphState) -> dict:
     """Deterministic AST/syntax check on proposed diff additions."""
-    diff = strip_markdown_fences(state.get("proposed_diff") or "")
+    raw_diff = state.get("proposed_diff")
+    if not raw_diff:
+        # L4 produced no diff (subprocess error, timeout, etc.) — preserve L4's error message
+        return {
+            "syntax_valid": False,
+            "critique_feedback": state.get("critique_feedback") or "No diff produced by Layer 4",
+            "unresolved_imports": [],
+            "diff_line_count": 0,
+        }
+    diff = strip_markdown_fences(raw_diff)
     additions = extract_diff_additions(diff)
     valid, error_msg = validate_python_syntax(additions)
     return {
