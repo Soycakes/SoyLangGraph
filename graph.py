@@ -8,6 +8,7 @@ from langgraph.graph import END, StateGraph
 from langgraph.types import Send, interrupt
 
 from state import CoworkerFinding, CoworkerInput, SharedBlackboard, SoyGraphState
+from verifiers import count_diff_lines, extract_diff_additions, strip_markdown_fences, validate_python_syntax
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -107,8 +108,16 @@ def layer4_synthesize(state: SoyGraphState) -> dict:
 
 
 def ast_gate(state: SoyGraphState) -> dict:
-    """Deterministic AST/syntax check — mock always passes."""
-    return {"syntax_valid": True, "unresolved_imports": []}
+    """Deterministic AST/syntax check on proposed diff additions."""
+    diff = strip_markdown_fences(state.get("proposed_diff") or "")
+    additions = extract_diff_additions(diff)
+    valid, error_msg = validate_python_syntax(additions)
+    return {
+        "syntax_valid": valid,
+        "critique_feedback": error_msg or None,  # README §6: "Append Error to Feedback" → L4 retry context
+        "unresolved_imports": [],
+        "diff_line_count": count_diff_lines(diff),
+    }
 
 
 def handle_ast_failure(state: SoyGraphState) -> dict:
