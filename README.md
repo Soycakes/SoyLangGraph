@@ -352,4 +352,4 @@ SoyLangGraph spans a dual-runtime environment:
   npm install -g @anthropic-ai/claude-code
   ```
 
-> Active development — Phase 1 spike targets `state.py` and `graph.py` only.
+> Active development — Phase 1 spike: `state.py` (canonical state schema), `graph.py` (mock spine nodes, routing, circuit breakers), `test_graph.py` (routing and integration tests, no LLM calls). Gate3 branching, `peer_verification`, and `human_approval` reject path are Phase 2.
