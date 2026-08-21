@@ -1,5 +1,5 @@
 """
-Deterministic verifiers — zero LLM cost, run post-Layer 4 before human gate.
+Syntax and diff checks that run before the human approval gate.
 """
 
 import ast
@@ -8,12 +8,13 @@ import textwrap
 
 
 def strip_markdown_fences(text: str) -> str:
-    """Remove markdown code fences (```diff, ```python, ``` etc.) from LLM stdout."""
-    return re.sub(r"^\s*```[\w]*\n?|^\s*```$", "", text, flags=re.MULTILINE).strip()
+    """Extracts code from markdown fences if present, returns the text stripped otherwise."""
+    m = re.search(r"```(?:\w+)?\n(.*?)```", text, re.DOTALL)
+    return m.group(1).strip() if m else text.strip()
 
 
 def count_diff_lines(diff: str) -> int:
-    """Count changed lines in a unified diff (additions + deletions, excluding file headers)."""
+    """Counts added and deleted lines in a unified diff, ignoring file headers."""
     return sum(
         1 for line in diff.splitlines()
         if (line.startswith("+") and not line.startswith("+++"))
@@ -22,7 +23,7 @@ def count_diff_lines(diff: str) -> int:
 
 
 def extract_diff_additions(diff: str) -> str:
-    """Return added lines from a unified diff as a single source string (+ prefix stripped)."""
+    """Pulls added lines out of a unified diff, stripping the leading + prefix."""
     return "\n".join(
         line[1:]
         for line in diff.splitlines()
@@ -31,10 +32,8 @@ def extract_diff_additions(diff: str) -> str:
 
 
 def validate_python_syntax(source: str) -> tuple[bool, str]:
-    """Try ast.parse() on source. Returns (True, '') on success, (False, error_msg) on failure.
-    ponytail: validates extracted additions only — not full file context.
-    Full-file validation (apply diff → parse whole file) belongs in Phase 3.
-    dedent strips common leading whitespace so additions inside indented scopes parse correctly.
+    """Parses source with ast.parse. Returns (True, '') or (False, error message).
+    dedent handles additions extracted from inside indented blocks.
     """
     try:
         ast.parse(textwrap.dedent(source))

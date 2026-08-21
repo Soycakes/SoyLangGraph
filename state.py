@@ -1,21 +1,18 @@
-import operator
+from dataclasses import dataclass, field
 from typing import Annotated, List, Literal, Optional, TypedDict
 
-from pydantic import BaseModel, Field
 
-
-class CoworkerFinding(BaseModel):
+@dataclass
+class CoworkerFinding:
     agent_id: str
     perspective_bias: str
     assessment: str
     suggested_modifications: List[str]
 
 
-class SharedBlackboard(BaseModel):
-    verified_files: List[str] = Field(default_factory=list)
-    system_constraints: List[str] = Field(default_factory=list)
-    rejected_paths: List[str] = Field(default_factory=list)
-    active_revelations: List[str] = Field(default_factory=list)
+@dataclass
+class SharedBlackboard:
+    system_constraints: List[str] = field(default_factory=list)
 
 
 class CoworkerInput(TypedDict):
@@ -27,17 +24,14 @@ class CoworkerInput(TypedDict):
 def reduce_findings(
     existing: List[CoworkerFinding], new: List[CoworkerFinding]
 ) -> List[CoworkerFinding]:
-    """Custom reducer for coworker_findings.
-    Empty new list is the reset sentinel emitted by synthesize_plan after distillation.
-    Non-empty list appends (accumulates concurrent Send() returns within a cycle).
-    """
+    """Reducer for coworker_findings. Empty list resets, non-empty appends."""
     if not new:
         return []
     return existing + new
 
 
 class SoyGraphState(TypedDict):
-    # Immutable anchor — never modified by agents
+    # Set at start, never changed
     original_prompt: str
     target_files: List[str]
 
@@ -45,22 +39,27 @@ class SoyGraphState(TypedDict):
     current_plan: Optional[str]
     layer_blackboard: SharedBlackboard
 
-    # Parallel fan-out — reduce_findings accumulates concurrent Send() returns;
-    # synthesize_plan resets the buffer each cycle by emitting [] as the sentinel.
+    # Parallel fanout: reduce_findings accumulates results, synthesize_plan resets with []
     coworker_findings: Annotated[List[CoworkerFinding], reduce_findings]
 
-    # Code & review artifacts
-    proposed_diff: Optional[str]
+    # Code generation artifacts
+    proposed_content: Optional[str]  # full file content from L4
+    proposed_diff: Optional[str]     # computed for display only
     critique_feedback: Optional[str]
 
     # Quality flags
     syntax_valid: bool
     unresolved_imports: List[str]
-    redteam_fatal_flaws: List[str]
     diff_line_count: int
 
     # Loop controls
-    critique_iteration_count: int  # capped by max_critique_cycles
-    syntax_retry_count: int        # capped at 2, then interrupt_human_escalation
+    critique_iteration_count: int  # escalates after MAX_CRITIQUE_CYCLES
+    syntax_retry_count: int        # escalates after MAX_SYNTAX_RETRIES
     fanout_depth: int
     interrupt_reason: Optional[str]
+
+    # Workspace & plan gate
+    execution_mode: str             # "interactive" or "auto"
+    workspace_context: Optional[dict]
+    plan_feedback: Optional[str]    # user correction when plan is rejected
+    plan_approved: Optional[bool]

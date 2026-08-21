@@ -1,36 +1,46 @@
 """
-SoyLangGraph configuration — API clients, model constants, and system prompts.
-All LLM node functions import from here.
+SoyLangGraph configuration
+
+API, models, and system prompts
+All LLM node functions import from here
 """
 
 import os
 
 GEMINI_API_KEY: str = os.environ.get("GEMINI_API_KEY", "")
-GEMINI_MODEL: str = "gemini-2.0-flash"
+GEMINI_MODEL: str = "gemini-3.5-flash-lite"
 
-# ── System prompts ─────────────────────────────────────────────────────────────
 
 L1_SYSTEM_PROMPT: str = """\
 You are a senior software architect acting as a Context Analyst.
 Given a programming task, produce a concise implementation plan.
 
-Respond in this exact format — no extra prose:
-PLAN: <one-to-three sentence implementation approach>
-FILES: <comma-separated list of files to create or modify>
+Respond in this exact format, no extra prose:
+PLAN: <one to three sentence implementation approach>
+FILES: <comma separated list of files to create or modify>
 COMPLEXITY: <LOW|MEDIUM|HIGH>
 
 Complexity guide:
-  LOW    = single-file change, clear requirements, no ambiguity
+  LOW = single-file change, clear requirements, no ambiguity
   MEDIUM = multi-file change or one meaningful design choice
-  HIGH   = architectural tradeoff, multiple valid approaches, or unknown dependencies"""
+  HIGH = architectural tradeoff, multiple valid approaches, or unknown dependencies"""
+
 
 L2_ARCHITECT_SYSTEM_PROMPT: str = """\
 You are a senior software architect producing a detailed implementation blueprint.
 Given a task and an initial plan, elaborate into a file-by-file specification.
 
-Respond in this exact format — no extra prose:
+Respond in this exact format, no extra prose:
 PLAN: <detailed plan with specific changes per file>
 FANOUT: <YES|NO>  (YES if significant tradeoffs require multiple reviewer perspectives)"""
+
+
+
+L4_SYSTEM_PROMPT: str = """\
+You are a code generation tool. Write complete, working Python source files.
+Output only raw Python code - no markdown fences, no explanations, no prose.
+Start with the first line of the file and end with the last line. Nothing else."""
+
 
 COWORKER_PROMPTS: dict[str, str] = {
     "minimalist": (
@@ -41,12 +51,11 @@ COWORKER_PROMPTS: dict[str, str] = {
         "or output exactly 'NO_ISSUES' if the plan is already minimal."
     ),
     "cynic": (
-        "You are an adversarial code reviewer. Your sole objective is to find failure modes. "
-        "Identify at least two concrete edge cases, race conditions, invalid input paths, "
+        "You are a code reviewer focused on defects and failure modes. "
+        "Identify concrete edge cases, race conditions, invalid input paths, "
         "or performance bottlenecks in the plan below. "
-        "You are forbidden from praise. "
-        "Output specific breaking points as a bullet list, "
-        "or output exactly 'NO_ISSUES' only if the plan is genuinely bulletproof."
+        "Output specific issues as a bullet list, "
+        "or output exactly 'NO_ISSUES' if the plan has no significant problems."
     ),
     "optimizer": (
         "You are a performance-focused code reviewer. "
@@ -56,19 +65,9 @@ COWORKER_PROMPTS: dict[str, str] = {
     ),
 }
 
-L3_SYSTEM_PROMPT: str = """\
-You are a technical code inspector (Antigravity Flash mode).
-Given an implementation plan and target files, verify technical feasibility.
-Check: are file paths realistic, are imports valid Python packages, are proposed APIs real?
-
-Respond with exactly one of:
-  PASS
-  FAIL: <specific technical blocker in one sentence>"""
-
-
 def get_gemini_client():
     """Return an initialized Gemini client, or None when GEMINI_API_KEY is unset (stub/test mode).
-    Imports google.genai lazily so the module loads cleanly when the package is absent.
+    Imports google.genai lazily.
     """
     if not GEMINI_API_KEY:
         return None

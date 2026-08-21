@@ -1,5 +1,5 @@
 """
-Unit tests for deterministic verifiers — no LLM, no graph, no IO.
+Tests for verifiers.py - pure functions, no LLM or IO.
 """
 
 import pytest
@@ -23,7 +23,7 @@ SAMPLE_DIFF = (
 )
 
 
-# ── strip_markdown_fences ─────────────────────────────────────────────────────
+# --- strip_markdown_fences ---
 
 class TestStripMarkdownFences:
     def test_strips_diff_fence(self):
@@ -53,7 +53,7 @@ class TestStripMarkdownFences:
         assert "```" not in result
 
 
-# ── count_diff_lines ──────────────────────────────────────────────────────────
+# --- count_diff_lines ---
 
 class TestCountDiffLines:
     def test_counts_additions_and_deletions(self):
@@ -80,7 +80,7 @@ class TestCountDiffLines:
         assert count_diff_lines(diff) == 2
 
 
-# ── extract_diff_additions ────────────────────────────────────────────────────
+# --- extract_diff_additions ---
 
 class TestExtractDiffAdditions:
     def test_extracts_added_lines(self):
@@ -110,7 +110,7 @@ class TestExtractDiffAdditions:
         assert result == "x = 1"
 
 
-# ── validate_python_syntax ────────────────────────────────────────────────────
+# --- validate_python_syntax ---
 
 class TestValidatePythonSyntax:
     def test_valid_assignment(self):
@@ -145,20 +145,18 @@ class TestValidatePythonSyntax:
         assert valid is False
 
     def test_indented_additions_from_function_body(self):
-        """Additions inside a function body carry leading whitespace — dedent must handle them."""
+        """Additions inside a function body carry leading whitespace - dedent must handle them."""
         source = "    x = 1\n    return x"  # as extracted from a diff inside a def block
         valid, msg = validate_python_syntax(source)
         assert valid is True, f"Expected valid after dedent, got: {msg}"
 
     def test_return_statement_in_partial_additions_passes(self):
-        """ast.parse in exec mode does not enforce return-outside-function (that's a compile-time check).
-        Partial additions containing return statements are not false-positively rejected in Python 3.12+.
-        """
+        """ast.parse doesn't flag return outside a function, so partial diff additions pass."""
         valid, _ = validate_python_syntax("return x")
         assert valid is True
 
 
-# ── end-to-end: strip → extract → validate ───────────────────────────────────
+# --- full pipeline: strip -> extract -> validate ---
 
 class TestVerifierPipeline:
     def test_fenced_diff_with_valid_python(self):

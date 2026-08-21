@@ -1,12 +1,13 @@
 """
-SoyLangGraph — orchestration graph.
-Nodes with real LLM calls fall back to stubs when GEMINI_API_KEY is unset,
-keeping unit tests fully isolated without any changes to the test suite.
+Orchestration graph.
+Defines the nodes and routing logic for the state machine.
 """
 
-import platform
+import difflib
+import glob
+from typing import Optional
+import os
 import re
-import subprocess
 
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, StateGraph
@@ -16,24 +17,22 @@ from config import (
     COWORKER_PROMPTS,
     GEMINI_MODEL,
     L1_SYSTEM_PROMPT,
+    L4_SYSTEM_PROMPT,
     get_gemini_client,
 )
+
 from state import CoworkerFinding, CoworkerInput, SharedBlackboard, SoyGraphState
 from verifiers import count_diff_lines, extract_diff_additions, strip_markdown_fences, validate_python_syntax
 
-# ── Config ────────────────────────────────────────────────────────────────────
-
+# Config
 MAX_CRITIQUE_CYCLES = 3
 MAX_SYNTAX_RETRIES = 2
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# Helpers
 
 def _blackboard_field(state: SoyGraphState, field: str, default):
-    """Safe access for SharedBlackboard fields — works with Pydantic models and plain dicts.
-    ponytail: MemorySaver keeps Pydantic objects intact; postgres/sqlite checkpointers deserialize
-    to dicts. This helper bridges both. Remove when checkpointer is finalized.
-    """
+    """Reads a field from the blackboard, which MemorySaver may deserialize as a plain dict."""
     bb = state["layer_blackboard"]
     if isinstance(bb, dict):
         return bb.get(field, default)
@@ -41,12 +40,15 @@ def _blackboard_field(state: SoyGraphState, field: str, default):
 
 
 def _gemini_generate(client, prompt: str, system: str) -> str:
-    """Single-call wrapper around client.models.generate_content."""
+    """Single call wrapper around client.models.generate_content."""
     from google.genai import types
     response = client.models.generate_content(
         model=GEMINI_MODEL,
         contents=prompt,
-        config=types.GenerateContentConfig(system_instruction=system),
+        config=types.GenerateContentConfig(
+            system_instruction=system,
+            automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
+        ),
     )
     return (response.text or "").strip()
 
@@ -60,17 +62,32 @@ def _extract_bullets(text: str) -> list[str]:
 
 
 def _parse_l1_response(text: str) -> dict:
-    """Extract PLAN from L1 response. Regex handles markdown bolding Gemini sometimes adds."""
-    match = re.search(r"(?:\*\*)?PLAN:?(?:\*\*)?\s*(.*?)(?=\nFILES:|\nCOMPLEXITY:|$)", text, re.IGNORECASE | re.DOTALL)
-    if match:
-        return {"current_plan": match.group(1).strip()}
-    return {"current_plan": text}  # fallback: treat whole response as plan
+    """Extract PLAN and FILES from L1 response. Handles markdown bolding Gemini sometimes adds."""
+    result = {}
+    plan_match = re.search(r"(?:\*\*)?PLAN:?(?:\*\*)?\s*(.*?)(?=\nFILES:|\nCOMPLEXITY:|$)", text, re.IGNORECASE | re.DOTALL)
+    result["current_plan"] = plan_match.group(1).strip() if plan_match else text
+
+    files_match = re.search(r"(?:\*\*)?FILES:?(?:\*\*)?\s*(.*?)(?=\nCOMPLEXITY:|$)", text, re.IGNORECASE | re.DOTALL)
+    if files_match:
+        files = [f.strip() for f in files_match.group(1).strip().split(",") if f.strip()]
+        if files:
+            result["target_files"] = files
+
+    return result
+
+
+def _compute_diff(filename: str, old_content: Optional[str], new_content: str) -> str:
+    """Produce a diff from old file content (or new files)"""
+    old_lines = (old_content or "").splitlines(keepends=True)
+    new_lines = new_content.splitlines(keepends=True)
+    fromfile = f"a/{filename}" if old_content else "/dev/null"
+    return "".join(difflib.unified_diff(old_lines, new_lines, fromfile=fromfile, tofile=f"b/{filename}"))
 
 
 def _parse_coworker_response(text: str, bias: str) -> dict:
     """Parse coworker LLM output into a CoworkerFinding, or return {} on NO_ISSUES.
-    Returning {} (omitting coworker_findings) is the correct reducer contract —
-    an empty list [] would wipe sibling coworker results.
+
+    Note : Return {} (omitting coworker_findings), an empty list [] would wipe sibling coworker results.
     """
     if "NO_ISSUES" in text.upper():
         return {}
@@ -86,39 +103,100 @@ def _parse_coworker_response(text: str, bias: str) -> dict:
     }
 
 
-# ── Stub / pass-through architecture nodes ───────────────────────────────────
+# Layer 0: Workspace scanner
 
-def l1_ponytail(state: SoyGraphState) -> dict:
-    """Ponytail YAGNI scope filter — stub: pass-through until Gemini integration."""
-    return {}
+_SCAN_SKIP = {".venv", "venv", "__pycache__", ".git", ".pytest_cache", "node_modules"}
+
+def workspace_scan(state: SoyGraphState) -> dict:
+    """Reads current file contents and repo layout before L1 runs."""
+    file_contexts = {}
+    for f in state.get("target_files", []):
+        if os.path.exists(f):
+            try:
+                with open(f, encoding="utf-8", errors="replace") as fh:
+                    file_contexts[f] = fh.read(8000)
+            except OSError:
+                file_contexts[f] = "[unreadable]"
+        else:
+            file_contexts[f] = None  # None = new file
+
+    repo_tree = sorted(
+        e for e in glob.glob("*") + glob.glob("*/*")
+        if not any(part in _SCAN_SKIP for part in e.replace("\\", "/").split("/"))
+    )[:60]
+
+    deps = ""
+    for dep_file in ("pyproject.toml", "requirements.txt", "package.json"):
+        if os.path.exists(dep_file):
+            try:
+                with open(dep_file, encoding="utf-8", errors="replace") as fh:
+                    deps = f"[{dep_file}]\n{fh.read(2000)}"
+                break
+            except OSError:
+                pass
+
+    return {"workspace_context": {"file_contexts": file_contexts, "repo_tree": repo_tree, "deps": deps}}
 
 
-def l3_ponytail(state: SoyGraphState) -> dict:
-    """Ponytail diff minimizer — stub: pass-through until diff budget logic lands."""
-    return {}
-
-
-def peer_verification(state: SoyGraphState) -> dict:
-    """Antigravity Flash peer check for Eureka revelations — stub: always debunks."""
-    return {"interrupt_reason": None}
-    # Phase 1: node registered but not yet wired into Gate3 conditional routing
-
-
-# ── Layer 1: Context Analyst ──────────────────────────────────────────────────
+# Layer 1: Context Analyst
 
 def layer1_context_check(state: SoyGraphState) -> dict:
-    """Gemini Flash context analysis. Falls back to stub when GEMINI_API_KEY is unset."""
+    """Analyzes the task and workspace context, produces an initial plan."""
+    workspace = state.get("workspace_context") or {}
+    file_contexts = workspace.get("file_contexts") or {}
+    repo_tree = workspace.get("repo_tree") or []
+    deps = workspace.get("deps") or ""
+
+    file_section = ""
+    for f, content in file_contexts.items():
+        if content is None:
+            file_section += f"\n{f}: NEW FILE (does not exist yet)\n"
+        else:
+            file_section += f"\n{f} (existing, first 2000 chars):\n{content[:2000]}\n"
+
+    prompt = state["original_prompt"]
+    plan_feedback = state.get("plan_feedback")
+    if plan_feedback:
+        prompt += f"\n\nPrevious plan was rejected. User correction: {plan_feedback}"
+    if file_section:
+        prompt += f"\n\nWorkspace context:{file_section}"
+    if repo_tree:
+        prompt += f"\n\nRepo structure: {', '.join(repo_tree[:20])}"
+    if deps:
+        prompt += f"\n\nDependencies:\n{deps}"
+
     client = get_gemini_client()
     if client is None:
-        return {"current_plan": f"[L1 stub] analyse: {state['original_prompt'][:80]}"}
-    text = _gemini_generate(client, state["original_prompt"], L1_SYSTEM_PROMPT)
+        stub = f"[L1 stub] analyse: {state['original_prompt'][:80]}"
+        if plan_feedback:
+            stub += f" (revised: {plan_feedback[:40]})"
+        return {"current_plan": stub}
+    text = _gemini_generate(client, prompt, L1_SYSTEM_PROMPT)
     return _parse_l1_response(text)
 
 
-# ── Layer 2: Architect + Coworker Fan-Out ─────────────────────────────────────
+# Plan gate
+
+def human_plan_review(state: SoyGraphState) -> dict:
+    """Checkpoint before fanout: user confirms or steers the L1 plan before coworkers run.
+    Resume: True = proceed, False = retry L1 silently, str = retry L1 with correction text.
+    """
+    feedback = interrupt({
+        "current_plan": state.get("current_plan"),
+        "target_files": state.get("target_files"),
+        "reason": "plan_approval",
+    })
+    if feedback is True:
+        return {"plan_approved": True, "plan_feedback": None}
+    if isinstance(feedback, str) and feedback:
+        return {"plan_approved": False, "plan_feedback": feedback}
+    return {"plan_approved": False, "plan_feedback": None}
+
+
+# Layer 2: Architect + Coworker Fanout
 
 def layer2_architect(state: SoyGraphState) -> dict:
-    """Gemini Flash system architect — stub sets fanout_depth=1. Demock in Phase 4."""
+    """Expands the plan into a spec and decides whether to fan out to coworkers."""
     return {
         "current_plan": state.get("current_plan") or "[L2 stub] architecture plan",
         "fanout_depth": 1,
@@ -126,9 +204,8 @@ def layer2_architect(state: SoyGraphState) -> dict:
 
 
 def coworker_agent(state: CoworkerInput) -> dict:
-    """Gemini Flash coworker with perspective bias. Falls back to stub when GEMINI_API_KEY is unset.
-    IMPORTANT: return {} (omit key) when no findings — never return coworker_findings=[].
-    An empty list is the reset sentinel in reduce_findings and will wipe sibling results.
+    """Reviews the plan from a specific perspective (minimalist/cynic/optimizer).
+    Returns {} when no findings - an empty list would wipe sibling results via the reducer.
     """
     bias = state.get("bias", "minimalist")
     client = get_gemini_client()
@@ -152,7 +229,7 @@ def coworker_agent(state: CoworkerInput) -> dict:
 
 
 def synthesize_plan(state: SoyGraphState) -> dict:
-    """Distill coworker findings into current_plan, then reset the buffer."""
+    """Merges coworker feedback into the plan and clears the findings buffer."""
     findings = state.get("coworker_findings", [])
     base_plan = state.get("current_plan") or ""
     if findings:
@@ -164,14 +241,14 @@ def synthesize_plan(state: SoyGraphState) -> dict:
         plan = base_plan
     return {
         "current_plan": plan,
-        "coworker_findings": [],  # reset sentinel — reduce_findings treats [] as replace
+        "coworker_findings": [],  # reset sentinel: reduce_findings treats [] as replace
     }
 
 
-# ── Layer 3: Technical Critique ───────────────────────────────────────────────
+# Layer 3: Technical Critique
 
 def layer3_critique(state: SoyGraphState) -> dict:
-    """Antigravity Flash + CLI — stub always passes. Demock in Phase 4."""
+    """Technical critic - stub, always passes."""
     return {"critique_feedback": "PASS"}
 
 
@@ -180,66 +257,57 @@ def handle_critique_failure(state: SoyGraphState) -> dict:
     return {"critique_iteration_count": state.get("critique_iteration_count", 0) + 1}
 
 
-# ── Layer 4: Lead Synthesizer ─────────────────────────────────────────────────
+# Layer 4: Lead Synthesizer
 
 def layer4_synthesize(state: SoyGraphState) -> dict:
-    """Claude Code headless subprocess. Falls back to stub diff when GEMINI_API_KEY is unset."""
+    """Generates the full file content and computes a diff against the current version."""
+    target_files = state.get("target_files") or []
+    if not target_files:
+        return {"proposed_content": None, "proposed_diff": None, "diff_line_count": 0,
+                "critique_feedback": "Layer 1 did not identify a target file"}
+    primary = target_files[0]
+    workspace = state.get("workspace_context") or {}
+    old_content: Optional[str] = (workspace.get("file_contexts") or {}).get(primary)
+    if old_content is None and os.path.exists(primary):
+        with open(primary, encoding="utf-8", errors="replace") as _fh:
+            old_content = _fh.read()
+
     client = get_gemini_client()
     if client is None:
-        return {
-            "proposed_diff": "--- a/stub.py\n+++ b/stub.py\n@@ -0,0 +1 @@\n+# stub\n",
-            "diff_line_count": 4,
-        }
+        stub_content = "# stub\n"
+        diff = _compute_diff(primary, old_content, stub_content)
+        return {"proposed_content": stub_content, "proposed_diff": diff, "diff_line_count": count_diff_lines(diff)}
+
+    prior_error = state.get("critique_feedback")
     prompt = (
-        f"Output ONLY a valid git unified diff for target files "
-        f"{state['target_files']}. No prose or explanations.\n\n"
-        f"Plan:\n{state['current_plan']}"
+        f"Write the complete implementation of `{primary}`.\n\n"
+        f"TASK: {state['original_prompt']}\n\n"
+        f"SPECIFICATION:\n{state['current_plan']}"
+        + (f"\n\nPREVIOUS ATTEMPT HAD THIS ERROR - fix it:\n{prior_error}" if prior_error else "")
     )
-    try:
-        result = subprocess.run(
-            ["claude", "-p", prompt],
-            capture_output=True,
-            text=True,
-            timeout=120,
-            shell=(platform.system() == "Windows"),  # claude installs as .cmd on Windows
-        )
-    except FileNotFoundError:
-        return {"proposed_diff": None, "critique_feedback": "claude CLI not found — install @anthropic-ai/claude-code"}
-    except subprocess.TimeoutExpired:
-        return {"proposed_diff": None, "critique_feedback": "claude subprocess timed out after 120s"}
-
-    if result.returncode != 0:
-        stderr = (result.stderr or "")[:300]
-        return {"proposed_diff": None, "critique_feedback": f"claude exit {result.returncode}: {stderr}"}
-
-    diff = result.stdout.strip()
-    return {
-        "proposed_diff": diff,
-        "diff_line_count": count_diff_lines(strip_markdown_fences(diff)),
-    }
+    content = strip_markdown_fences(_gemini_generate(client, prompt, L4_SYSTEM_PROMPT))
+    diff = _compute_diff(primary, old_content, content)
+    return {"proposed_content": content, "proposed_diff": diff, "diff_line_count": count_diff_lines(diff)}
 
 
-# ── AST gate & approval ───────────────────────────────────────────────────────
+# AST gate & approval
 
 def ast_gate(state: SoyGraphState) -> dict:
-    """Deterministic AST/syntax check on proposed diff additions."""
-    raw_diff = state.get("proposed_diff")
-    if not raw_diff:
-        # L4 produced no diff (subprocess error, timeout, etc.) — preserve L4's error message
+    """Validates Python syntax before showing the diff to the user."""
+    content = state.get("proposed_content")
+    if not content:
         return {
             "syntax_valid": False,
-            "critique_feedback": state.get("critique_feedback") or "No diff produced by Layer 4",
+            "critique_feedback": state.get("critique_feedback") or "No content produced by Layer 4",
             "unresolved_imports": [],
             "diff_line_count": 0,
         }
-    diff = strip_markdown_fences(raw_diff)
-    additions = extract_diff_additions(diff)
-    valid, error_msg = validate_python_syntax(additions)
+    valid, error_msg = validate_python_syntax(content)
     return {
         "syntax_valid": valid,
-        "critique_feedback": error_msg or None,  # README §6: "Append Error to Feedback" → L4 retry context
+        "critique_feedback": error_msg or None,
         "unresolved_imports": [],
-        "diff_line_count": count_diff_lines(diff),
+        "diff_line_count": state.get("diff_line_count", 0),
     }
 
 
@@ -249,8 +317,7 @@ def handle_ast_failure(state: SoyGraphState) -> dict:
 
 
 def human_approval(state: SoyGraphState) -> dict:
-    """Mandatory pre-exec human review gate.
-    interrupt() pauses here with diff payload.
+    """Mandatory human review gate before writing to disk.
     Resume value: truthy = approved, falsy = rejected (routes back to L2).
     """
     approved = interrupt({"proposed_diff": state.get("proposed_diff"), "reason": "pre_exec_approval"})
@@ -259,38 +326,61 @@ def human_approval(state: SoyGraphState) -> dict:
     return {"interrupt_reason": None}
 
 
+_PROTECTED_FILES = frozenset({
+    "graph.py", "state.py", "config.py", "run_live.py",
+    "formatters.py", "verifiers.py", "test_graph.py", "test_verifiers.py",
+})
+
+
 def apply_diff(state: SoyGraphState) -> dict:
-    """Write approved diff to disk — stub logs intent only."""
+    """Write approved content to disk."""
+    content = state.get("proposed_content")
+    target_files = state.get("target_files") or []
+    if not content or not target_files:
+        return {}
+    primary = target_files[0]
+    # Block writes to framework files in the root dir
+    if os.path.basename(primary) in _PROTECTED_FILES and not os.path.dirname(primary):
+        print(f"  [apply] BLOCKED: {primary!r} is a protected framework file")
+        return {}
+    parent = os.path.dirname(primary)
+    if parent and not os.path.exists(parent):
+        os.makedirs(parent, exist_ok=True)
+    with open(primary, "w", encoding="utf-8") as fh:
+        fh.write(content)
+    print(f"  [apply] wrote {primary} ({len(content)} chars)")
     return {}
 
 
 def interrupt_human_escalation(state: SoyGraphState) -> dict:
-    """Hard-stop: circuit breaker tripped, needs human direction."""
+    """Max retries exceeded - pauses and asks the user what to do next."""
     interrupt({"reason": state.get("interrupt_reason", "circuit_breaker")})
     return {}
 
 
-# ── Routing ───────────────────────────────────────────────────────────────────
+# Routing
 
 def route_l1_output(state: SoyGraphState):
-    """Conditional Ponytail scope prune — stub always bypasses."""
-    # Real impl: if scope_creep_detected → "l1_ponytail"
-    return "layer2_architect"
+    """Auto mode skips the plan gate. Interactive mode pauses for human review."""
+    if state.get("execution_mode", "interactive") == "auto":
+        return "layer2_architect"
+    return "human_plan_review"
+
+
+def route_after_plan_review(state: SoyGraphState):
+    if state.get("plan_approved"):
+        return "layer2_architect"
+    return "layer1_context_check"
 
 
 def route_planning_layer(state: SoyGraphState):
-    """Fan-out to coworkers when fanout_depth > 0, else go straight to synthesize."""
+    """Fans out to coworkers when fanout_depth > 0, otherwise goes straight to synthesize."""
     if state.get("fanout_depth", 0) > 0:
-        payload = CoworkerInput(
-            plan_to_review=state.get("current_plan") or "",
-            system_constraints=_blackboard_field(state, "system_constraints", []),
-            bias="minimalist",  # overridden per-Send below
-        )
-        return [
-            Send("coworker_agent", {**payload, "bias": "minimalist"}),
-            Send("coworker_agent", {**payload, "bias": "cynic"}),
-            Send("coworker_agent", {**payload, "bias": "optimizer"}),
-        ]
+        base = {
+            "plan_to_review": state.get("current_plan") or "",
+            "system_constraints": _blackboard_field(state, "system_constraints", []),
+        }
+        return [Send("coworker_agent", {**base, "bias": b}) for b in ("minimalist", "cynic", "optimizer")]
     return "synthesize_plan"
 
 
@@ -316,13 +406,14 @@ def route_after_human_approval(state: SoyGraphState):
     return "apply_diff"
 
 
-# ── Graph assembly ─────────────────────────────────────────────────────────────
+# Graph assembly
 
 def build_graph():
     g = StateGraph(SoyGraphState)
 
-    # Spine nodes
+    g.add_node("workspace_scan", workspace_scan)
     g.add_node("layer1_context_check", layer1_context_check)
+    g.add_node("human_plan_review", human_plan_review)
     g.add_node("layer2_architect", layer2_architect)
     g.add_node("coworker_agent", coworker_agent)
     g.add_node("synthesize_plan", synthesize_plan)
@@ -334,15 +425,11 @@ def build_graph():
     g.add_node("human_approval", human_approval)
     g.add_node("apply_diff", apply_diff)
     g.add_node("interrupt_human_escalation", interrupt_human_escalation)
-    # Architecture stub nodes (topology matches README Section 6 flowchart)
-    g.add_node("l1_ponytail", l1_ponytail)
-    g.add_node("l3_ponytail", l3_ponytail)
-    # Phase 1: peer_verification registered but not yet wired into Gate3 conditional routing
-    g.add_node("peer_verification", peer_verification)
 
-    g.set_entry_point("layer1_context_check")
-    g.add_conditional_edges("layer1_context_check", route_l1_output, ["l1_ponytail", "layer2_architect"])
-    g.add_edge("l1_ponytail", "layer2_architect")
+    g.set_entry_point("workspace_scan")
+    g.add_edge("workspace_scan", "layer1_context_check")
+    g.add_conditional_edges("layer1_context_check", route_l1_output, ["layer2_architect", "human_plan_review"])
+    g.add_conditional_edges("human_plan_review", route_after_plan_review, ["layer2_architect", "layer1_context_check"])
 
     g.add_conditional_edges(
         "layer2_architect",
@@ -375,9 +462,6 @@ def build_graph():
     )
     g.add_edge("apply_diff", END)
     g.add_edge("interrupt_human_escalation", END)
-
-    # ponytail: l3_ponytail not yet wired into a conditional route; add when diff budget logic lands
-    g.add_edge("l3_ponytail", "layer4_synthesize")
 
     return g.compile(checkpointer=MemorySaver())
 

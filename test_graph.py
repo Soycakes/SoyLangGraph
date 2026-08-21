@@ -1,5 +1,5 @@
 """
-Phase 1 unit + integration tests — state machine correctness, no LLM calls.
+Unit and integration tests - all LLM nodes run as stubs.
 """
 
 import graph as graph_module
@@ -15,12 +15,14 @@ from graph import (
     route_after_ast,
     route_after_critique,
     route_after_human_approval,
+    route_after_plan_review,
+    route_l1_output,
     route_planning_layer,
+    workspace_scan,
 )
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
-
+# --- Helpers
 def base_state(**overrides) -> SoyGraphState:
     defaults: SoyGraphState = {
         "original_prompt": "Add a login page",
@@ -28,16 +30,21 @@ def base_state(**overrides) -> SoyGraphState:
         "current_plan": None,
         "layer_blackboard": SharedBlackboard(),
         "coworker_findings": [],
+        "proposed_content": None,
         "proposed_diff": None,
         "critique_feedback": None,
         "syntax_valid": False,
         "unresolved_imports": [],
-        "redteam_fatal_flaws": [],
         "diff_line_count": 0,
         "critique_iteration_count": 0,
         "syntax_retry_count": 0,
         "fanout_depth": 0,
         "interrupt_reason": None,
+        # auto skips plan gate so existing integration tests need no changes
+        "execution_mode": "auto",
+        "workspace_context": None,
+        "plan_feedback": None,
+        "plan_approved": None,
     }
     defaults.update(overrides)
     return defaults
@@ -52,8 +59,7 @@ def _finding(bias: str) -> CoworkerFinding:
     )
 
 
-# ── State initialisation & immutability ──────────────────────────────────────
-
+# --- State initialisation & immutability
 class TestStateInit:
     def test_original_prompt_preserved(self):
         assert base_state()["original_prompt"] == "Add a login page"
@@ -72,8 +78,7 @@ class TestStateInit:
         assert state["syntax_retry_count"] == 0
 
 
-# ── reduce_findings reducer ───────────────────────────────────────────────────
-
+# --- reduce_findings reducer
 class TestReduceFindings:
     def test_nonempty_new_appends(self):
         existing = [_finding("minimalist")]
@@ -83,12 +88,10 @@ class TestReduceFindings:
         assert result[1].perspective_bias == "cynic"
 
     def test_empty_new_resets_to_empty(self):
-        """synthesize_plan emits [] as a reset sentinel — must wipe existing findings."""
         existing = [_finding("minimalist"), _finding("cynic")]
         assert reduce_findings(existing, []) == []
 
     def test_three_concurrent_sends_accumulate(self):
-        """Simulate three coworkers whose results are merged sequentially by LangGraph."""
         result = []
         for bias in ["minimalist", "cynic", "optimizer"]:
             result = reduce_findings(result, [_finding(bias)])
@@ -104,8 +107,7 @@ class TestReduceFindings:
         assert after_new[0].perspective_bias == "optimizer"
 
 
-# ── CoworkerInput & fan-out routing ──────────────────────────────────────────
-
+# --- CoworkerInput & fanout routing
 class TestCoworkerFanOut:
     def test_route_fanout_returns_three_sends_when_depth_gt_zero(self):
         state = base_state(fanout_depth=1, current_plan="plan v1")
@@ -129,8 +131,7 @@ class TestCoworkerFanOut:
             assert send.arg["plan_to_review"] == "the plan"
 
 
-# ── Circuit breaker routing (unit) ────────────────────────────────────────────
-
+# --- Circuit breaker routing (unit)
 class TestCircuitBreakers:
     def test_critique_pass_goes_to_l4(self):
         state = base_state(critique_iteration_count=0, critique_feedback="PASS")
@@ -159,8 +160,7 @@ class TestCircuitBreakers:
         assert route_after_ast(base_state(syntax_valid=False, syntax_retry_count=MAX_SYNTAX_RETRIES + 1)) == "interrupt_human_escalation"
 
 
-# ── human_approval reject routing ────────────────────────────────────────────
-
+# --- human_approval reject routing
 class TestHumanApproval:
     def test_approved_routes_to_apply_diff(self):
         assert route_after_human_approval(base_state(interrupt_reason=None)) == "apply_diff"
@@ -169,12 +169,11 @@ class TestHumanApproval:
         assert route_after_human_approval(base_state(interrupt_reason="rejected_by_user")) == "layer2_architect"
 
     def test_other_interrupt_reason_routes_to_apply_diff(self):
-        # Any non-rejected interrupt_reason falls through to apply_diff
+        # anything other than rejected_by_user falls through to apply_diff
         assert route_after_human_approval(base_state(interrupt_reason="something_else")) == "apply_diff"
 
 
-# ── Integration: counter increment nodes ─────────────────────────────────────
-
+# --- Integration: counter increment nodes
 class TestCounterNodes:
     def test_handle_critique_failure_increments(self):
         from graph import handle_critique_failure
@@ -192,8 +191,7 @@ class TestCounterNodes:
         assert result["critique_iteration_count"] == 1
 
 
-# ── Integration: full graph ───────────────────────────────────────────────────
-
+# --- Integration: full graph
 class TestGraphIntegration:
     def test_graph_runs_to_human_approval_interrupt(self):
         g = build_graph()
@@ -209,7 +207,7 @@ class TestGraphIntegration:
         assert g.get_state(config).next == ()
 
     def test_reject_routes_back_to_human_approval(self):
-        """Command(resume=False) → rejected_by_user → L2 → ... → human_approval again."""
+        """Command(resume=False) -> rejected_by_user -> L2 -> ... -> human_approval again."""
         g = build_graph()
         config = {"configurable": {"thread_id": "int-rej"}}
         g.invoke(base_state(), config=config)
@@ -218,11 +216,11 @@ class TestGraphIntegration:
         assert snap.next == ("human_approval",)
 
     def test_reject_clears_interrupt_reason_on_re_approval(self):
-        """After reject→re-plan→approve, interrupt_reason must not be 'rejected_by_user'."""
+        """After reject -> replan -> approve, interrupt_reason must not be 'rejected_by_user'."""
         g = build_graph()
         config = {"configurable": {"thread_id": "int-rej2"}}
         g.invoke(base_state(), config=config)
-        g.invoke(Command(resume=False), config=config)  # reject → back to L2 → human_approval
+        g.invoke(Command(resume=False), config=config)  # reject -> back to L2 -> human_approval
         g.invoke(Command(resume=True), config=config)   # approve
         snap = g.get_state(config)
         assert snap.next == ()
@@ -257,10 +255,7 @@ class TestGraphIntegration:
         assert snap.next == ("interrupt_human_escalation",)
 
     def test_second_cycle_findings_not_contaminated_by_first(self, monkeypatch):
-        """coworker_findings are reset by synthesize_plan after each cycle — don't accumulate.
-        synthesize_plan consumes and clears findings before routing onward, so both checkpoints
-        at human_approval show [] rather than the 3+3=6 that operator.add without reset would give.
-        """
+        """synthesize_plan resets findings each cycle, so a second rejection doesn't double them up."""
         g = build_graph()
         config = {"configurable": {"thread_id": "int-5"}}
         g.invoke(base_state(), config=config)
@@ -270,19 +265,23 @@ class TestGraphIntegration:
         assert snap1.next == ("human_approval",)
         assert snap1.values["coworker_findings"] == []  # consumed and reset by synthesize_plan
 
-        # Reject → cycle 2 runs → synthesize_plan resets again
+        # Reject -> cycle 2 runs -> synthesize_plan resets again
         g.invoke(Command(resume=False), config=config)
         snap2 = g.get_state(config)
         assert snap2.next == ("human_approval",)
         assert snap2.values["coworker_findings"] == []  # still reset, not 6 accumulated items
 
+    def test_auto_mode_skips_plan_gate(self):
+        """execution_mode='auto' must reach human_approval without pausing at human_plan_review."""
+        g = build_graph()
+        config = {"configurable": {"thread_id": "auto-1"}}
+        g.invoke(base_state(execution_mode="auto"), config=config)
+        assert g.get_state(config).next == ("human_approval",)
+
     def test_null_diff_from_l4_does_not_false_pass_ast_gate(self, monkeypatch):
-        """Regression: ast_gate must not route to human_approval when proposed_diff is None.
-        A failed subprocess sets proposed_diff=None; ast_gate previously false-passed because
-        ast.parse('') returns True, bypassing retries and presenting a blank diff to the user.
-        """
+        """If L4 produces no content, ast_gate should escalate rather than pass a blank diff through."""
         def l4_always_fails(state):
-            return {"proposed_diff": None, "critique_feedback": "claude CLI not found"}
+            return {"proposed_content": None, "proposed_diff": None, "critique_feedback": "claude CLI not found"}
 
         monkeypatch.setattr(graph_module, "layer4_synthesize", l4_always_fails)
         g = build_graph()
@@ -295,6 +294,17 @@ class TestGraphIntegration:
         assert snap.next == ("interrupt_human_escalation",)
         assert snap.values["syntax_retry_count"] == MAX_SYNTAX_RETRIES
 
+    def test_workspace_scan_in_graph_populates_context(self):
+        """workspace_scan node runs first and sets workspace_context in state."""
+        g = build_graph()
+        config = {"configurable": {"thread_id": "ws-1"}}
+        g.invoke(base_state(), config=config)
+        snap = g.get_state(config)
+        ctx = snap.values.get("workspace_context")
+        assert ctx is not None
+        assert "file_contexts" in ctx
+        assert "repo_tree" in ctx
+
     def test_original_prompt_preserved_through_full_graph(self):
         g = build_graph()
         config = {"configurable": {"thread_id": "int-6"}}
@@ -302,3 +312,70 @@ class TestGraphIntegration:
         g.invoke(base_state(original_prompt=prompt), config=config)
         g.invoke(Command(resume=True), config=config)
         assert g.get_state(config).values["original_prompt"] == prompt
+
+
+# --- Plan gate
+class TestPlanGate:
+    def test_interactive_mode_pauses_at_plan_gate(self):
+        g = build_graph()
+        config = {"configurable": {"thread_id": "pg-1"}}
+        g.invoke(base_state(execution_mode="interactive"), config=config)
+        assert g.get_state(config).next == ("human_plan_review",)
+
+    def test_plan_gate_approve_proceeds_to_human_approval(self):
+        g = build_graph()
+        config = {"configurable": {"thread_id": "pg-2"}}
+        g.invoke(base_state(execution_mode="interactive"), config=config)
+        g.invoke(Command(resume=True), config=config)
+        assert g.get_state(config).next == ("human_approval",)
+
+    def test_plan_gate_reject_loops_back_to_plan_gate(self):
+        """False resume -> L1 retry -> pauses at human_plan_review again."""
+        g = build_graph()
+        config = {"configurable": {"thread_id": "pg-3"}}
+        g.invoke(base_state(execution_mode="interactive"), config=config)
+        g.invoke(Command(resume=False), config=config)
+        assert g.get_state(config).next == ("human_plan_review",)
+
+    def test_plan_gate_string_feedback_sets_plan_feedback(self):
+        g = build_graph()
+        config = {"configurable": {"thread_id": "pg-4"}}
+        g.invoke(base_state(execution_mode="interactive"), config=config)
+        g.invoke(Command(resume="put it in utils/strings.py instead"), config=config)
+        snap = g.get_state(config)
+        # Still paused at plan gate (looped back) but plan_feedback was consumed by L1
+        assert snap.next == ("human_plan_review",)
+
+    def test_route_l1_output_auto_skips_gate(self):
+        assert route_l1_output(base_state(execution_mode="auto")) == "layer2_architect"
+
+    def test_route_l1_output_interactive_uses_gate(self):
+        assert route_l1_output(base_state(execution_mode="interactive")) == "human_plan_review"
+
+    def test_route_after_plan_review_approved(self):
+        assert route_after_plan_review(base_state(plan_approved=True)) == "layer2_architect"
+
+    def test_route_after_plan_review_rejected(self):
+        assert route_after_plan_review(base_state(plan_approved=False)) == "layer1_context_check"
+
+
+# --- Workspace scan (unit)
+class TestWorkspaceScan:
+    def test_existing_file_captured(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        f = tmp_path / "foo.py"
+        f.write_text("x = 1")
+        result = workspace_scan(base_state(target_files=["foo.py"]))
+        ctx = result["workspace_context"]
+        assert ctx["file_contexts"]["foo.py"] == "x = 1"
+
+    def test_missing_file_is_none(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        result = workspace_scan(base_state(target_files=["ghost.py"]))
+        assert result["workspace_context"]["file_contexts"]["ghost.py"] is None
+
+    def test_repo_tree_populated(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "myfile.py").write_text("")
+        result = workspace_scan(base_state(target_files=[]))
+        assert isinstance(result["workspace_context"]["repo_tree"], list)
